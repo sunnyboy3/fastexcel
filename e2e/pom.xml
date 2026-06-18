@@ -19,7 +19,7 @@
     <dependencies>
         <dependency>
             <groupId>org.dhatim</groupId>
-            <artifactId>fastexcel</artifactId>
+            <artifactId>fastexcel-writer</artifactId>
         </dependency>
         <dependency>
             <groupId>org.dhatim</groupId>

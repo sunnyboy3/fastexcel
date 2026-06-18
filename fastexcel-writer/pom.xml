@@ -9,7 +9,7 @@
         <relativePath>../pom.xml</relativePath>
     </parent>
 
-    <artifactId>fastexcel</artifactId>
+    <artifactId>fastexcel-writer</artifactId>
     <name>Fastexcel Writer</name>
     <packaging>jar</packaging>
     <url>https://github.com/dhatim/fastexcel</url>

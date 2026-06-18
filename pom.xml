@@ -11,12 +11,25 @@
     <modules>
         <module>fastexcel-writer</module>
         <module>fastexcel-reader</module>
+		<module>fastexcel-annotation</module>
+        <module>fastexcel-batch</module>
         <module>e2e</module>
     </modules>
 
     <name>Fastexcel Project</name>
     <description>Fast library to process Excel workbooks</description>
     <url>https://github.com/dhatim/fastexcel</url>
+
+    <distributionManagement>
+        <repository>
+            <id>maven-releases</id>
+            <url>http://118.24.71.244:8081/repository/maven-releases/</url>
+        </repository>
+        <snapshotRepository>
+            <id>maven-snapshots</id>
+            <url>http://118.24.71.244:8081/repository/maven-snapshots/</url>
+        </snapshotRepository>
+    </distributionManagement>
 
     <licenses>
         <license>
@@ -78,12 +91,22 @@
             </dependency>
             <dependency>
                 <groupId>org.dhatim</groupId>
-                <artifactId>fastexcel</artifactId>
+                <artifactId>fastexcel-writer</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>
                 <groupId>org.dhatim</groupId>
                 <artifactId>fastexcel-reader</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.dhatim</groupId>
+                <artifactId>fastexcel-annotation</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.dhatim</groupId>
+                <artifactId>fastexcel-batch</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>

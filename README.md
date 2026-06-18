@@ -36,11 +36,37 @@ Note heap memory usage is measured just before flushing the workbook to the outp
 
 - Java 8+. Build with Maven.
 - Include the following dependency in your POM:
+
+| 模块 | 用途 |
+|------|------|
+| `fastexcel` (writer) | 底层 Excel 写入 |
+| `fastexcel-reader` | 底层 Excel 读取 |
+| `fastexcel-annotation` | 注解驱动的 Bean ↔ Excel 映射 |
+| `fastexcel-batch` | 批量分页导出引擎 |
+
 ```xml
+<!-- 底层读写 -->
 <dependency>
     <groupId>org.dhatim</groupId>
     <artifactId>fastexcel</artifactId>
     <version>0.20.2</version>
+</dependency>
+<dependency>
+    <groupId>org.dhatim</groupId>
+    <artifactId>fastexcel-reader</artifactId>
+    <version>0.18.4</version>
+</dependency>
+<!-- 注解映射 -->
+<dependency>
+    <groupId>org.dhatim</groupId>
+    <artifactId>fastexcel-annotation</artifactId>
+    <version>0-SNAPSHOT</version>
+</dependency>
+<!-- 批量导出 -->
+<dependency>
+    <groupId>org.dhatim</groupId>
+    <artifactId>fastexcel-batch</artifactId>
+    <version>0-SNAPSHOT</version>
 </dependency>
 ```
 
@@ -393,6 +419,218 @@ boolean cellInErrorIfParseError = true; // If true, cell type is ERROR if it is 
 ReadingOptions readingOptions = new ReadingOptions(withCellFormat, cellInErrorIfParseError);
 try (ReadableWorkbook wb = new ReadableWorkbook(is, readingOptions)) {
 ```
+
+
+# fastexcel-annotation
+
+注解驱动的 Excel ↔ Java Bean 映射模块，基于 fastexcel-reader 和 fastexcel-writer 构建。
+
+## 依赖
+
+```xml
+<dependency>
+    <groupId>org.dhatim</groupId>
+    <artifactId>fastexcel-annotation</artifactId>
+    <version>0-SNAPSHOT</version>
+</dependency>
+```
+
+## 注解
+
+| 注解 | 说明 |
+|------|------|
+| `@ExcelProperty(index=0)` | 按列索引映射（从零开始） |
+| `@ExcelProperty("列名")` | 按表头名匹配 |
+| `@ExcelIgnore` | 排除字段，不参与读写 |
+
+`index` 优先级高于表头名。两者都未设置时按字段声明顺序自动映射。
+
+## 支持的类型
+
+| Java 类型 | 读取 | 写入 |
+|-----------|------|------|
+| `String` | `cell.getText()` | 字符串单元格 |
+| `Integer / int` | 数值 → int | 数值单元格 |
+| `Long / long` | 数值 → long | 数值单元格 |
+| `Double / double` | 数值 → double | 数值单元格 |
+| `BigDecimal` | `cell.asNumber()` | 数值单元格 |
+| `Boolean / boolean` | 布尔值；数值 0→false, ≠0→true | 布尔单元格 |
+| `java.util.Date` | Excel 日期序列号 → Date | 日期单元格 |
+| `LocalDateTime` | `cell.asDate()` | 日期时间单元格 |
+| `LocalDate` | `cell.asDate().toLocalDate()` | 日期单元格 |
+
+## 读取 Excel → Bean
+
+```java
+// 定义 Bean
+public class Employee {
+    @ExcelProperty(index = 0)
+    private String name;
+
+    @ExcelProperty("入职日期")
+    private LocalDate hireDate;
+
+    @ExcelIgnore
+    private String internalNote;
+
+    // 必须有无参构造器
+    public Employee() {}
+    // getters ...
+}
+
+// 读取
+try (ReadableWorkbook wb = new ReadableWorkbook(new File("employees.xlsx"))) {
+    ExcelReaderMapper<Employee> mapper = new ExcelReaderMapper<>(Employee.class);
+
+    // 小文件：直接读取到 List
+    List<Employee> list = mapper.map(wb.getFirstSheet());
+
+    // 大文件：流式读取，不占内存
+    try (Stream<Employee> stream = mapper.stream(wb.getFirstSheet())) {
+        stream.filter(e -> e.getName() != null).forEach(...);
+    }
+}
+```
+
+如果 Bean 中有 `@ExcelProperty("入职日期")` 这类按表头名映射的字段，`map()` 会自动将第一行作为表头行消费，从第二行开始解析数据。
+
+## 写入 Bean → Excel
+
+```java
+List<Employee> employees = dao.findAll();
+
+try (OutputStream os = new FileOutputStream("output.xlsx");
+     Workbook wb = new Workbook(os, "HR系统", "1.0")) {
+
+    Worksheet ws = wb.newWorksheet("员工表");
+    ExcelWriterMapper<Employee> mapper = new ExcelWriterMapper<>(Employee.class);
+
+    // 参数：worksheet, 数据, 起始行, 是否写表头
+    mapper.write(ws, employees, 0, true);
+}
+```
+
+表头优先使用 `@ExcelProperty` 的 `value` 值，其次使用字段名。`@ExcelIgnore` 的字段不会写入，`null` 字段对应的单元格留空。
+
+# fastexcel-batch
+
+批量导出引擎——将分页数据并发写入多 Sheet 的 Excel 工作簿。适用于大数据量导出场景。
+
+## 设计模式
+
+采用 **生产者-消费者流水线**：写入当前 Sheet 时，下一个 Sheet 的数据已在后台拉取。内存上限为 `sheetSize × 并发线程数`，不会一次性加载全部数据。
+
+## 依赖
+
+```xml
+<dependency>
+    <groupId>org.dhatim</groupId>
+    <artifactId>fastexcel-batch</artifactId>
+    <version>0-SNAPSHOT</version>
+</dependency>
+```
+
+## 快速开始
+
+```java
+// 1. 配置导出参数
+ExportOptions options = ExportOptions.builder(100000)   // 总行数
+    .sheetSize(10000)                                   // 每个 Sheet 最大行数
+    .threadPoolSize(4)                                   // 并发拉取线程数
+    .sheetNamePrefix("用户数据")                           // Sheet 名称前缀
+    .build();
+
+// 2. 创建导出器
+BatchExcelWriter<User, String> writer = new BatchExcelWriter<>(
+    options,
+    (params, req) -> userDao.findByPage(req.getOffset(), req.getLimit()),
+    RowWriters.annotation(User.class),                   // 注解模式
+    (params, req) -> "/api/users?offset=" + req.getOffset() // 数据路径
+);
+
+// 3. 执行导出
+ExportResult result = writer.export(WorkbookSink.toPath(Path.of("/data/users.xlsx")), null);
+
+System.out.println(result.getTotalRows());   // 总行数
+System.out.println(result.getSheetCount());  // Sheet 数量
+```
+
+## 输出目标 (WorkbookSink)
+
+```java
+// 本地文件
+writer.export(WorkbookSink.toFile(new File("/tmp/export.xlsx")), params);
+writer.export(WorkbookSink.toPath(Path.of("/data/export.xlsx")), params);
+
+// 内存（测试用）
+writer.export(WorkbookSink.toByteArray(), params);
+
+// 自定义——上传 OSS/S3
+WorkbookSink cloudSink = WorkbookSink.of(() -> {
+    PipedOutputStream pos = new PipedOutputStream();
+    executor.submit(() -> ossClient.upload(bucket, key, new PipedInputStream(pos)));
+    return pos;
+});
+writer.export(cloudSink, params);
+```
+
+## 扩展点
+
+| 接口 | 作用 | 默认行为 |
+|------|------|---------|
+| `RowWriter<T>` | 控制每行如何写入 | `RowWriters.annotation()` / `RowWriters.raw()` |
+| `SheetNamingStrategy` | 自定义 Sheet 命名 | `prefix_1`, `prefix_2`... |
+| `WorkbookCustomizer` | 工作簿生命周期钩子 | 空实现 |
+| `ProgressListener` | 进度回调 | 无 |
+
+```java
+BatchExcelWriter<User, Void> writer = new BatchExcelWriter<>(
+    options,
+    provider,
+    RowWriters.annotation(User.class),
+    null,                                   // dataPathFn
+    SheetNamingStrategy.numberedSuffix(),   // 命名策略
+    new WorkbookCustomizer() {              // 文档属性
+        @Override
+        public void beforeSheets(Workbook wb) {
+            wb.properties().setTitle("用户数据导出报表");
+        }
+    },
+    (sheetIdx, total, rows, written) ->     // 进度监听
+        log.info("Sheet {}/{}: {} 行 (累计 {})", sheetIdx + 1, total, rows, written)
+);
+```
+
+## 原始模式（不用注解）
+
+```java
+RowWriter<String[]> rawWriter = new RowWriter<String[]>() {
+    @Override
+    public void writeHeader(Worksheet ws) {
+        ws.value(0, 0, "姓名");
+        ws.value(0, 1, "年龄");
+    }
+    @Override
+    public void writeRow(Worksheet ws, int rowIdx, String[] row) {
+        ws.value(rowIdx, 0, row[0]);
+        ws.value(rowIdx, 1, row[1]);
+    }
+};
+
+BatchExcelWriter<String[], Void> writer = new BatchExcelWriter<>(
+    options, provider, RowWriters.raw(rawWriter));
+```
+
+## 配置参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `totalRows` | 必填 | 导出总行数 |
+| `sheetSize` | 1000 | 每个 Sheet 最大行数 |
+| `threadPoolSize` | 1 | 并发拉取线程数 |
+| `queueCapacity` | 2 | 内部工作队列容量 |
+| `flushInterval` | 0 | 每 N 行刷新一次（0 = 不刷新） |
+| `sheetNamePrefix` | "Sheet" | Sheet 名称前缀 |
 
 ## More Information
 ### Reading and Writing of encryption-protected documents
