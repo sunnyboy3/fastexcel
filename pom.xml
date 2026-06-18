@@ -21,14 +21,6 @@
     <url>https://github.com/dhatim/fastexcel</url>
 
     <distributionManagement>
-        <repository>
-            <id>maven-releases</id>
-            <url>http://118.24.71.244:8081/repository/maven-releases/</url>
-        </repository>
-        <snapshotRepository>
-            <id>maven-snapshots</id>
-            <url>http://118.24.71.244:8081/repository/maven-snapshots/</url>
-        </snapshotRepository>
     </distributionManagement>
 
     <licenses>
