@@ -20,7 +20,11 @@ package org.dhatim.fastexcel.batch;
  */
 public interface ProgressListener {
 
-    /** 在每个 Sheet 完全写入之后调用。 */
+    /** 在每个 Sheet 开始写入之前调用。{@code sheetCount} 在流式模式下为 -1（未知）。 */
+    default void onSheetStarted(int sheetIndex, int sheetCount) {
+    }
+
+    /** 在每个 Sheet 完全写入之后调用。{@code sheetCount} 在流式模式下为 -1（未知）。 */
     void onSheetCompleted(int sheetIndex, int sheetCount, int rowsInSheet, int totalWritten);
 
     /** 在导出完成时调用（无论成功或失败）。 */

@@ -21,6 +21,8 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
 /**
  * 已解析的字段到列映射元数据的内部容器。
@@ -32,6 +34,9 @@ import java.util.List;
  * 包内可见——非公开 API。
  */
 final class FieldMapping {
+
+    private static final ConcurrentMap<Class<?>, List<FieldMapping>> CACHE =
+            new ConcurrentHashMap<>();
 
     final Field field;
     final String headerName;
@@ -58,6 +63,29 @@ final class FieldMapping {
     }
 
     /**
+     * 解析给定 Bean 类的字段映射，结果会被全局缓存。
+     * 由于 {@code columnIndex} 可能在表头解析时被修改，
+     * 每次调用返回的是缓存的深拷贝。
+     */
+    static List<FieldMapping> resolve(Class<?> beanType) {
+        List<FieldMapping> cached = CACHE.computeIfAbsent(beanType, FieldMapping::doResolve);
+        return deepCopy(cached);
+    }
+
+    static void clearCache() {
+        CACHE.clear();
+    }
+
+    private static List<FieldMapping> deepCopy(List<FieldMapping> source) {
+        List<FieldMapping> copy = new ArrayList<>(source.size());
+        for (FieldMapping m : source) {
+            copy.add(new FieldMapping(m.field, m.columnIndex, m.headerName,
+                    m.hasExplicitIndex, m.hasHeaderName, m.cellReader, m.cellWriter));
+        }
+        return Collections.unmodifiableList(copy);
+    }
+
+    /**
      * 一次性解析给定 Bean 类的字段映射。
      * <ul>
      *   <li>跳过 static、transient 以及 {@code @ExcelIgnore} 字段。</li>
@@ -66,7 +94,7 @@ final class FieldMapping {
      *   <li>对每个映射字段调用 {@code setAccessible(true)}。</li>
      * </ul>
      */
-    static List<FieldMapping> resolve(Class<?> beanType) {
+    private static List<FieldMapping> doResolve(Class<?> beanType) {
         List<FieldMapping> mappings = new ArrayList<FieldMapping>();
         int autoIndex = 0;
 
@@ -104,14 +132,16 @@ final class FieldMapping {
             if (!hasExplicitIndex) {
                 columnIndex = autoIndex;
             }
+            // 自增索引始终跟随最后一个已分配的列号，使得显式 index
+            // 不会与后续自增字段串列（例如 explicit index=5 后自增字段从 6 开始）。
+            autoIndex = Math.max(autoIndex, columnIndex) + 1;
 
             Class<?> type = field.getType();
-            TypeConverter.CellReader reader = TypeConverter.readerFor(type);
-            TypeConverter.CellWriter writer = TypeConverter.writerFor(type);
+            TypeConverter.CellReader reader = TypeConverter.readerFor(type, field);
+            TypeConverter.CellWriter writer = TypeConverter.writerFor(type, field);
 
             mappings.add(new FieldMapping(field, columnIndex, headerName,
                     hasExplicitIndex, hasHeaderName, reader, writer));
-            autoIndex++;
         }
         return Collections.unmodifiableList(mappings);
     }

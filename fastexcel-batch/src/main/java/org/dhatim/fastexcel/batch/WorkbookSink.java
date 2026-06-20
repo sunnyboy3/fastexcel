@@ -74,9 +74,18 @@ public interface WorkbookSink {
         return ByteArrayOutputStream::new;
     }
 
-    /** 从已有的 {@link OutputStream} 包装（调用方管理流生命周期）。 */
+    /**
+     * 从已有的 {@link OutputStream} 包装（调用方管理流生命周期）。
+     * <p>返回的流的 {@code close()} 为空操作，不会关闭底层流。</p>
+     */
     static WorkbookSink ofStream(OutputStream os) {
-        return () -> os;
+        return () -> new OutputStream() {
+            @Override public void write(int b) throws IOException { os.write(b); }
+            @Override public void write(byte[] b) throws IOException { os.write(b); }
+            @Override public void write(byte[] b, int off, int len) throws IOException { os.write(b, off, len); }
+            @Override public void flush() throws IOException { os.flush(); }
+            @Override public void close() { /* no-op: caller manages lifecycle */ }
+        };
     }
 
     /** 从自定义 {@link OutputStream} 工厂创建。 */

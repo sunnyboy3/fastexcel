@@ -94,7 +94,11 @@ public class ExcelReaderMapper<T> {
                 int ci = mapping.columnIndex;
                 Cell cell = ci < rowCellCount ? row.getCell(ci) : null;
                 Object value = mapping.cellReader.read(cell);
-                mapping.field.set(instance, value);
+                // 对基本类型字段，null（空单元格）会让 Field.set 抛
+                // IllegalArgumentException；跳过则保留字段默认值（0 / false）。
+                if (value != null) {
+                    mapping.field.set(instance, value);
+                }
             }
             return instance;
         } catch (ReflectiveOperationException e) {
@@ -119,7 +123,6 @@ public class ExcelReaderMapper<T> {
         if (needsHeaderResolution && !headerResolved) {
             resolveHeaderRow(rows.get(0));
             startIndex = 1;
-            headerResolved = true;
         }
         List<T> result = new ArrayList<T>(rows.size() - startIndex);
         for (int i = startIndex; i < rows.size(); i++) {
@@ -176,7 +179,6 @@ public class ExcelReaderMapper<T> {
             if (hasHeader) {
                 resolveHeaderRow(holder[0]);
             }
-            headerResolved = true;
         }
 
         Spliterator<T> beanSpliterator = new Spliterators.AbstractSpliterator<T>(
@@ -193,8 +195,8 @@ public class ExcelReaderMapper<T> {
         return stream;
     }
 
-    // --- header resolution state ---
-    private boolean headerResolved = false;
+    // --- header resolution state (volatile for thread-safety) ---
+    private volatile boolean headerResolved = false;
 
     /**
      * 从表头行解析基于表头名称映射的列。
@@ -204,7 +206,10 @@ public class ExcelReaderMapper<T> {
      * @param headerRow 表头行
      * @throws ExcelMappingException 如果未找到所需的表头名称
      */
-    public void resolveHeaderRow(Row headerRow) {
+    public synchronized void resolveHeaderRow(Row headerRow) {
+        if (headerResolved) {
+            return;
+        }
         Map<String, Integer> headerMap = new HashMap<String, Integer>();
         for (int i = 0; i < headerRow.getCellCount(); i++) {
             String text = headerRow.getCellText(i).trim();
