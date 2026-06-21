@@ -308,14 +308,74 @@ public class BatchExcelWriter<T, P> {
                 rowWriter.writeHeader(ws);
 
                 int rowIdx = 1;
-                for (int i = 0, len = rows.size(); i < len; i++) {
-                    T row = rows.get(i);
-                    rowWriter.writeRow(ws, rowIdx, row);
-                    rowIdx++;
-                    writtenRows++;
-                    // 中间刷新：减少内存峰值
-                    if (flushInterval > 0 && rowIdx % flushInterval == 0) {
-                        ws.flush();
+                int prepareThreshold = options.getPrepareParallelThreshold();
+
+                if (rowWriter.supportsParallelPrepare()
+                        && rows.size() >= prepareThreshold
+                        && concurrency > 1) {
+                    // ══ Phase 1: 并行准备（CPU 密集，多线程）═══════════
+                    int prepThreads = options.getPrepareThreads() > 0
+                            ? Math.min(options.getPrepareThreads(), concurrency)
+                            : concurrency;
+                    int chunkSize = Math.max(1,
+                            (rows.size() + prepThreads - 1) / prepThreads);
+                    int actualChunks = (rows.size() + chunkSize - 1) / chunkSize;
+                    List<Future<Object[][]>> prepFutures =
+                            new ArrayList<>(actualChunks);
+
+                    for (int start = 0; start < rows.size(); start += chunkSize) {
+                        final int sIdx = start;
+                        final int end = Math.min(start + chunkSize, rows.size());
+                        // 通过 subList 创建视图避免数据拷贝，多线程只读安全
+                        final List<T> slice = rows.subList(sIdx, end);
+                        prepFutures.add(executor.submit(() -> {
+                            Object[][] chunk = new Object[slice.size()][];
+                            for (int j = 0, jlen = slice.size(); j < jlen; j++) {
+                                chunk[j] = rowWriter.prepare(slice.get(j));
+                            }
+                            return chunk;
+                        }));
+                    }
+
+                    // ══ Phase 2: 串行写入（I/O，单线程）═══════════════
+                    for (int ci = 0; ci < prepFutures.size(); ci++) {
+                        Object[][] chunk;
+                        try {
+                            chunk = prepFutures.get(ci).get();
+                        } catch (InterruptedException e) {
+                            // 取消剩余未完成的 futures
+                            for (int cj = ci + 1; cj < prepFutures.size(); cj++) {
+                                prepFutures.get(cj).cancel(true);
+                            }
+                            Thread.currentThread().interrupt();
+                            throw new BatchExcelExportException(
+                                    "Row preparation interrupted for sheet " + s, e);
+                        } catch (ExecutionException e) {
+                            for (int cj = ci + 1; cj < prepFutures.size(); cj++) {
+                                prepFutures.get(cj).cancel(true);
+                            }
+                            Throwable cause = e.getCause();
+                            throw new BatchExcelExportException(
+                                    "Row preparation failed for sheet " + s, cause);
+                        }
+                        for (Object[] prep : chunk) {
+                            rowWriter.writePreparedRow(ws, rowIdx++, prep);
+                            writtenRows++;
+                            if (flushInterval > 0 && rowIdx % flushInterval == 0) {
+                                ws.flush();
+                            }
+                        }
+                    }
+                } else {
+                    // 退化路径：串行写入（原有逻辑）
+                    for (int i = 0, len = rows.size(); i < len; i++) {
+                        T row = rows.get(i);
+                        rowWriter.writeRow(ws, rowIdx, row);
+                        rowIdx++;
+                        writtenRows++;
+                        if (flushInterval > 0 && rowIdx % flushInterval == 0) {
+                            ws.flush();
+                        }
                     }
                 }
                 // 确保最后一批数据写入：在 sheet 关闭前 flush

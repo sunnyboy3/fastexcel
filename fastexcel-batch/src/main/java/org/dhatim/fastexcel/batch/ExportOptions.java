@@ -42,6 +42,8 @@ public final class ExportOptions {
     private final long fetchTimeoutMs;
     private final long idleThreadTimeoutSec;
     private final boolean failFast;
+    private final int prepareParallelThreshold;
+    private final int prepareThreads;
 
     private ExportOptions(Builder builder) {
         this.totalRows = builder.totalRows;
@@ -54,6 +56,8 @@ public final class ExportOptions {
         this.fetchTimeoutMs = builder.fetchTimeoutMs;
         this.idleThreadTimeoutSec = builder.idleThreadTimeoutSec;
         this.failFast = builder.failFast;
+        this.prepareParallelThreshold = builder.prepareParallelThreshold;
+        this.prepareThreads = builder.prepareThreads;
     }
 
     /**
@@ -90,6 +94,13 @@ public final class ExportOptions {
     public long getIdleThreadTimeoutSec() { return idleThreadTimeoutSec; }
     /** 是否在首次 fetch 失败时立即中止（而非继续处理已排队的数据）。 */
     public boolean isFailFast()         { return failFast; }
+    /**
+     * 单 Sheet 内启用并行准备的最小行数阈值。
+     * 当一个 Sheet 的行数小于此值时，回退到串行写入。
+     */
+    public int getPrepareParallelThreshold() { return prepareParallelThreshold; }
+    /** 单 Sheet 内并行准备使用的线程数。取 0 时使用 {@link #getThreadPoolSize()}。 */
+    public int getPrepareThreads()           { return prepareThreads; }
 
     public static final class Builder {
         private final int totalRows;
@@ -102,6 +113,8 @@ public final class ExportOptions {
         private long fetchTimeoutMs = 0;
         private long idleThreadTimeoutSec = 60;
         private boolean failFast = true;
+        private int prepareParallelThreshold = 1000;
+        private int prepareThreads = 0;
 
         Builder(int totalRows) {
             if (totalRows <= 0) {
@@ -196,6 +209,33 @@ public final class ExportOptions {
          */
         public Builder failFast(boolean failFast) {
             this.failFast = failFast;
+            return this;
+        }
+
+        /**
+         * 单 Sheet 内启用并行准备的最小行数阈值（默认 1000）。
+         * 当行数小于此值时，跳过并行准备以节省线程调度开销。
+         * 仅在 {@link RowWriter#supportsParallelPrepare()} 为 true 时生效。
+         */
+        public Builder prepareParallelThreshold(int prepareParallelThreshold) {
+            if (prepareParallelThreshold <= 0) {
+                throw new IllegalArgumentException(
+                        "prepareParallelThreshold must be > 0, was "
+                                + prepareParallelThreshold);
+            }
+            this.prepareParallelThreshold = prepareParallelThreshold;
+            return this;
+        }
+
+        /**
+         * 单 Sheet 内并行准备的线程数（默认 0，表示使用 {@link #threadPoolSize}）。
+         */
+        public Builder prepareThreads(int prepareThreads) {
+            if (prepareThreads < 0) {
+                throw new IllegalArgumentException(
+                        "prepareThreads must be >= 0, was " + prepareThreads);
+            }
+            this.prepareThreads = prepareThreads;
             return this;
         }
 

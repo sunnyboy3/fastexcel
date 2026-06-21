@@ -28,15 +28,18 @@ public final class RowWriters {
 
     /**
      * 创建一个使用 {@link ExcelWriterMapper} 来写入注解 Bean 的
-     * {@link RowWriter}。每行通过映射器的单 Bean {@code writeRow}
-     * 方法写入，以避免每行的列表分配开销。
+     * {@link RowWriter}。
+     *
+     * <p>返回的实现支持 {@link RowWriter#prepare(Object)} /
+     * {@link RowWriter#writePreparedRow(Worksheet, int, Object[])}，
+     * 使得 {@link BatchExcelWriter} 可以在同 Sheet 内并行预计算行数据。</p>
      *
      * @param beanType 带有注解的 Bean 类
      * @param <T>      Bean 类型
      * @return 由 {@code ExcelWriterMapper} 支持的 RowWriter
      */
     public static <T> RowWriter<T> annotation(Class<T> beanType) {
-        ExcelWriterMapper<T> mapper = new ExcelWriterMapper<T>(beanType);
+        ExcelWriterMapper<T> mapper = new ExcelWriterMapper<>(beanType);
         return new RowWriter<T>() {
             @Override
             public void writeHeader(Worksheet worksheet) {
@@ -47,11 +50,28 @@ public final class RowWriters {
             public void writeRow(Worksheet worksheet, int rowIndex, T row) {
                 mapper.writeRow(worksheet, rowIndex, row);
             }
+
+            @Override
+            public Object[] prepare(T row) {
+                return mapper.prepareRow(row);
+            }
+
+            @Override
+            public void writePreparedRow(Worksheet worksheet, int rowIndex,
+                                          Object[] prepared) {
+                mapper.writePreparedRow(worksheet, rowIndex, prepared);
+            }
+
+            @Override
+            public boolean supportsParallelPrepare() {
+                return true;
+            }
         };
     }
 
     /**
      * 创建一个委托给给定原始写入器的 {@link RowWriter}。
+     * 原始写入器可以自行实现 prepare/write 分离方法以启用并行支持。
      *
      * @param writer 原始行写入器
      * @param <T>    行数据类型

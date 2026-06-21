@@ -631,6 +631,92 @@ BatchExcelWriter<String[], Void> writer = new BatchExcelWriter<>(
 | `queueCapacity` | 2 | 内部工作队列容量 |
 | `flushInterval` | 0 | 每 N 行刷新一次（0 = 不刷新） |
 | `sheetNamePrefix` | "Sheet" | Sheet 名称前缀 |
+| `fetchTimeoutMs` | 0 | 每次 fetch 超时（毫秒），0 = 无限 |
+| `prepareParallelThreshold` | 1000 | 单 Sheet 启用并行准备的最小行数阈值 |
+| `prepareThreads` | 0 | 并行准备的线程数，0 = 使用 threadPoolSize |
+
+## 同 Sheet 并行准备 (v1.1+)
+
+当使用 `RowWriters.annotation()` 时，`BatchExcelWriter` 支持**同 Sheet 内多线程并行预计算行数据**。
+
+### 原理
+
+```
+串行写入（原逻辑）:
+  for each row:
+    field.get(bean) → Converter → ws.value()  ← 全部在一条路径
+
+prepare-write 分离（并行）:
+  ┌─ Thread 1: field.get(row0..99)  → values[][]  ─┐
+  ├─ Thread 2: field.get(row100..199) → values[][]  ─┤  并行 (CPU)
+  └─ Thread 3: field.get(row200..299) → values[][]  ─┘
+                                                      │
+  主线程: ws.value(0,col,v0) → ws.value(1,col,v1) → ... ← 串行 (I/O)
+```
+
+- **Phase 1 — 并行准备**：多线程对各自 chunk 内的行执行 `field.get()` + `Converter` 取值，不涉及任何 I/O 操作，完全线程安全
+- **Phase 2 — 串行写入**：主线程按 chunk 顺序将预计算的值逐一调用 `ws.value()` 写入
+
+### 生效条件
+
+同时满足以下所有条件时自动启用，否则**透明退化到原串行逻辑**：
+
+1. `RowWriter.supportsParallelPrepare() == true`（`RowWriters.annotation()` 已实现）
+2. 单 Sheet 行数 ≥ `prepareParallelThreshold`（默认 1000）
+3. `threadPoolSize > 1`
+
+### 配置示例
+
+```java
+ExportOptions options = ExportOptions.builder(200_000)
+    .sheetSize(20_000)
+    .threadPoolSize(6)         // 6 个线程同时用于 fetch + 准备
+    .prepareParallelThreshold(2000)  // 每个 Sheet ≥ 2000 行时才并行准备
+    .prepareThreads(4)              // 准备阶段最多用 4 个线程（0 = 复用 threadPoolSize）
+    .build();
+
+BatchExcelWriter<Order, Void> writer = new BatchExcelWriter<>(
+    options,
+    (params, req) -> dao.findByPage(req.getOffset(), req.getLimit()),
+    RowWriters.annotation(Order.class));
+```
+
+### 自定义 RowWriter 的并行支持
+
+原始模式也可实现 `prepare()` / `writePreparedRow()` 来启用并行：
+
+```java
+RowWriter<String[]> rawWriter = new RowWriter<String[]>() {
+    @Override public void writeHeader(Worksheet ws) { ... }
+
+    @Override public void writeRow(Worksheet ws, int ri, String[] row) {
+        ws.value(ri, 0, row[0]);
+        ws.value(ri, 1, row[1]);
+    }
+
+    // ── 实现并行支持 ──────────────────────────────────
+    @Override public Object[] prepare(String[] row) {
+        // 纯 CPU 预处理，无 I/O
+        return new Object[]{row[0].trim(), Integer.parseInt(row[1])};
+    }
+
+    @Override public void writePreparedRow(Worksheet ws, int ri, Object[] p) {
+        ws.value(ri, 0, (String) p[0]);
+        ws.value(ri, 1, (Integer) p[1]);
+    }
+
+    @Override public boolean supportsParallelPrepare() { return true; }
+};
+```
+
+### 性能建议
+
+| 场景 | 建议 |
+|------|------|
+| 字段数 ≤ 3 且全为 String | 并行开销 > 收益，保持串行 |
+| 字段数 ≥ 8 或有自定义 Converter | 建议启用，CPU 收益显著 |
+| Date / BigDecimal 密集 | prepare 中的格式化有开销，并行有价值 |
+| I/O 瓶颈（慢速输出流） | 收益有限，瓶颈在写入阶段 |
 
 ## More Information
 ### Reading and Writing of encryption-protected documents

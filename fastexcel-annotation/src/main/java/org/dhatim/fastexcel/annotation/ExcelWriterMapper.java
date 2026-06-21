@@ -122,6 +122,54 @@ public class ExcelWriterMapper<T> {
         return Collections.unmodifiableList(fieldMappingsList);
     }
 
+    // ── prepare-write 分离（并行支持）───────────────────────────────
+
+    /**
+     * 预计算单行的列值数组——仅执行反射取值，不涉及 {@link Worksheet} 写入。
+     * 此方法不包含任何 I/O 操作，线程安全，可在多个线程中并行调用。
+     *
+     * @param bean 要预计算的行数据
+     * @return 列值数组，长度等于映射字段数；{@code values[i]} 可能为 null
+     * @throws ExcelMappingException 如果字段访问失败
+     */
+    public Object[] prepareRow(T bean) {
+        FieldMapping[] mappings = this.fieldMappings;
+        Object[] values = new Object[mappings.length];
+        try {
+            for (int i = 0, len = mappings.length; i < len; i++) {
+                values[i] = mappings[i].field.get(bean);
+            }
+        } catch (IllegalAccessException e) {
+            throw new ExcelMappingException(
+                    "Cannot read field value from " + bean.getClass().getName(), e);
+        }
+        return values;
+    }
+
+    /**
+     * 将预计算的行数据写入 Worksheet——跳过反射取值步骤，直接写入。
+     * 必须由<b>单一线程</b>在持有 Worksheet 时调用（Worksheet 非线程安全）。
+     *
+     * @param worksheet 目标工作表
+     * @param rowNum    从零开始的行索引
+     * @param values    由 {@link #prepareRow(Object)} 返回的列值数组
+     */
+    public void writePreparedRow(Worksheet worksheet, int rowNum, Object[] values) {
+        FieldMapping[] mappings = this.fieldMappings;
+        for (int i = 0, len = mappings.length; i < len; i++) {
+            Object value = values[i];
+            if (value != null) {
+                mappings[i].cellWriter.write(worksheet, rowNum,
+                        mappings[i].columnIndex, value);
+            }
+        }
+    }
+
+    /** 返回映射的列数（即 {@link #prepareRow} 返回的数组长度）。 */
+    public int columnCount() {
+        return fieldMappings.length;
+    }
+
     private static <T> void writeSingleBean(Worksheet worksheet, int rowNum,
                                              T bean, FieldMapping[] mappings) {
         try {
