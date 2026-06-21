@@ -65,18 +65,23 @@ final class FieldMapping {
     /**
      * 解析给定 Bean 类的字段映射，结果会被全局缓存。
      * 由于 {@code columnIndex} 可能在表头解析时被修改，
-     * 每次调用返回的是缓存的深拷贝。
+     * 每次调用返回缓存的浅拷贝（仅复制 columnIndex 数组）。
      */
     static List<FieldMapping> resolve(Class<?> beanType) {
         List<FieldMapping> cached = CACHE.computeIfAbsent(beanType, FieldMapping::doResolve);
-        return deepCopy(cached);
+        // 浅拷贝：仅复制 columnIndex，复用所有其他字段
+        return shallowCopy(cached);
     }
 
     static void clearCache() {
         CACHE.clear();
     }
 
-    private static List<FieldMapping> deepCopy(List<FieldMapping> source) {
+    /**
+     * 浅拷贝：仅复制 columnIndex 值到新的 FieldMapping 实例，
+     * 避免修改缓存中的原始对象。复用 CellReader/CellWriter/Field 引用。
+     */
+    private static List<FieldMapping> shallowCopy(List<FieldMapping> source) {
         List<FieldMapping> copy = new ArrayList<>(source.size());
         for (FieldMapping m : source) {
             copy.add(new FieldMapping(m.field, m.columnIndex, m.headerName,
@@ -92,18 +97,16 @@ final class FieldMapping {
      *   <li>预绑定 {@code CellReader} / {@code CellWriter}，
      *       避免每行重复进行类型分发。</li>
      *   <li>对每个映射字段调用 {@code setAccessible(true)}。</li>
+     *   <li>父类字段优先（在子类字段之前）。</li>
      * </ul>
      */
     private static List<FieldMapping> doResolve(Class<?> beanType) {
-        List<FieldMapping> mappings = new ArrayList<FieldMapping>();
+        List<FieldMapping> mappings = new ArrayList<>();
         int autoIndex = 0;
 
-        for (Field field : getAllFields(beanType)) {
+        for (Field field : resolveFields(beanType)) {
             int mod = field.getModifiers();
-            if (Modifier.isStatic(mod)) {
-                continue;
-            }
-            if (Modifier.isTransient(mod)) {
+            if (Modifier.isStatic(mod) || Modifier.isTransient(mod)) {
                 continue;
             }
             if (field.isAnnotationPresent(ExcelIgnore.class)) {
@@ -147,15 +150,23 @@ final class FieldMapping {
     }
 
     /**
-     * 从类层次结构中收集所有声明的字段（父类优先）。
+     * 从类层次结构中收集所有声明的字段（父类优先），O(n) 时间。
+     * 使用递归 + 后序收集，避免 ArrayList 头部插入的 O(n²) 偏移。
      */
-    private static List<Field> getAllFields(Class<?> type) {
-        List<Field> fields = new ArrayList<Field>();
-        Class<?> current = type;
-        while (current != null && current != Object.class) {
-            fields.addAll(0, Arrays.asList(current.getDeclaredFields()));
-            current = current.getSuperclass();
+    private static List<Field> resolveFields(Class<?> type) {
+        List<Field> result = new ArrayList<>();
+        collectFields(type, result);
+        return result;
+    }
+
+    private static void collectFields(Class<?> type, List<Field> result) {
+        if (type == null || type == Object.class) {
+            return;
         }
-        return fields;
+        // 先递归父类，再添加子类字段（父类优先）
+        collectFields(type.getSuperclass(), result);
+        Field[] declared = type.getDeclaredFields();
+        // 批量添加比逐个 addAll 更高效
+        result.addAll(Arrays.asList(declared));
     }
 }

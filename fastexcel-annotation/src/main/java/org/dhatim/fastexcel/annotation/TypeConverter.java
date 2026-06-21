@@ -24,7 +24,10 @@ import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.util.Collections;
 import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
@@ -44,6 +47,10 @@ final class TypeConverter {
     private static final ConcurrentMap<Class<? extends Converter<?>>, Converter<?>> CONVERTER_CACHE =
             new ConcurrentHashMap<>();
 
+    /** 枚举常量缓存：避免每次调用 Enum.valueOf() 的反射开销。 */
+    private static final ConcurrentMap<Class<? extends Enum<?>>, Map<String, Enum<?>>> ENUM_CACHE =
+            new ConcurrentHashMap<>();
+
     /**
      * 从 {@link Cell} 中提取类型化值的读取函数，
      * 当单元格为 null 或为空时返回 {@code null}。
@@ -57,6 +64,161 @@ final class TypeConverter {
      */
     interface CellWriter {
         void write(Worksheet worksheet, int row, int col, Object value);
+    }
+
+    // ── Map-based dispatch: O(1) lookup vs O(n) if-else chain ─────────
+
+    private static final Map<Class<?>, CellReader> READER_MAP;
+    private static final Map<Class<?>, CellWriter> WRITER_MAP;
+
+    static {
+        Map<Class<?>, CellReader> r = new HashMap<>(32);
+        Map<Class<?>, CellWriter> w = new HashMap<>(32);
+
+        // ── Readers ───────────────────────────────────────────────
+
+        CellReader stringReader = cell -> {
+            if (cell == null || cell.getType() == CellType.EMPTY) return null;
+            return cell.getText();
+        };
+        r.put(String.class, stringReader);
+
+        CellReader bigDecimalReader = cell -> {
+            if (cell == null || cell.getType() == CellType.EMPTY) return null;
+            CellType ct = cell.getType();
+            if (ct == CellType.NUMBER || ct == CellType.FORMULA) return cell.asNumber();
+            throw new ExcelMappingException("Cannot convert cell type " + ct + " to BigDecimal");
+        };
+        r.put(BigDecimal.class, bigDecimalReader);
+
+        CellReader intReader = cell -> {
+            if (cell == null || cell.getType() == CellType.EMPTY) return null;
+            BigDecimal n = requireNumeric(cell);
+            return n != null ? Integer.valueOf(n.intValue()) : null;
+        };
+        r.put(Integer.class, intReader);
+        r.put(int.class, intReader);
+
+        CellReader longReader = cell -> {
+            if (cell == null || cell.getType() == CellType.EMPTY) return null;
+            BigDecimal n = requireNumeric(cell);
+            return n != null ? Long.valueOf(n.longValue()) : null;
+        };
+        r.put(Long.class, longReader);
+        r.put(long.class, longReader);
+
+        CellReader doubleReader = cell -> {
+            if (cell == null || cell.getType() == CellType.EMPTY) return null;
+            BigDecimal n = requireNumeric(cell);
+            return n != null ? Double.valueOf(n.doubleValue()) : null;
+        };
+        r.put(Double.class, doubleReader);
+        r.put(double.class, doubleReader);
+
+        CellReader floatReader = cell -> {
+            if (cell == null || cell.getType() == CellType.EMPTY) return null;
+            BigDecimal n = requireNumeric(cell);
+            return n != null ? Float.valueOf(n.floatValue()) : null;
+        };
+        r.put(Float.class, floatReader);
+        r.put(float.class, floatReader);
+
+        CellReader shortReader = cell -> {
+            if (cell == null || cell.getType() == CellType.EMPTY) return null;
+            BigDecimal n = requireNumeric(cell);
+            return n != null ? Short.valueOf(n.shortValue()) : null;
+        };
+        r.put(Short.class, shortReader);
+        r.put(short.class, shortReader);
+
+        CellReader byteReader = cell -> {
+            if (cell == null || cell.getType() == CellType.EMPTY) return null;
+            BigDecimal n = requireNumeric(cell);
+            return n != null ? Byte.valueOf(n.byteValue()) : null;
+        };
+        r.put(Byte.class, byteReader);
+        r.put(byte.class, byteReader);
+
+        CellReader booleanReader = cell -> {
+            if (cell == null || cell.getType() == CellType.EMPTY) return null;
+            CellType ct = cell.getType();
+            if (ct == CellType.NUMBER) {
+                return cell.asNumber().compareTo(BigDecimal.ZERO) != 0;
+            }
+            if (ct == CellType.BOOLEAN || ct == CellType.FORMULA) {
+                return cell.asBoolean();
+            }
+            throw new ExcelMappingException("Cannot convert cell type " + ct + " to Boolean");
+        };
+        r.put(Boolean.class, booleanReader);
+        r.put(boolean.class, booleanReader);
+
+        CellReader dateReader = cell -> {
+            if (cell == null || cell.getType() == CellType.EMPTY) return null;
+            LocalDateTime ldt = cell.asDate();
+            return ldt != null ? new Date(ldt.atZone(SYSTEM_ZONE).toInstant().toEpochMilli()) : null;
+        };
+        r.put(Date.class, dateReader);
+
+        CellReader localDateTimeReader = cell -> {
+            if (cell == null || cell.getType() == CellType.EMPTY) return null;
+            return cell.asDate();
+        };
+        r.put(LocalDateTime.class, localDateTimeReader);
+
+        CellReader localDateReader = cell -> {
+            if (cell == null || cell.getType() == CellType.EMPTY) return null;
+            LocalDateTime ldt = cell.asDate();
+            return ldt != null ? ldt.toLocalDate() : null;
+        };
+        r.put(LocalDate.class, localDateReader);
+
+        CellReader zonedDateTimeReader = cell -> {
+            if (cell == null || cell.getType() == CellType.EMPTY) return null;
+            LocalDateTime ldt = cell.asDate();
+            return ldt != null ? ldt.atZone(SYSTEM_ZONE) : null;
+        };
+        r.put(java.time.ZonedDateTime.class, zonedDateTimeReader);
+
+        READER_MAP = Collections.unmodifiableMap(r);
+
+        // ── Writers ───────────────────────────────────────────────
+
+        CellWriter stringWriter = (ws, row, col, v) -> ws.value(row, col, (String) v);
+        w.put(String.class, stringWriter);
+
+        CellWriter numberWriter = (ws, row, col, v) -> ws.value(row, col, (Number) v);
+        w.put(BigDecimal.class, numberWriter);
+        w.put(Double.class, numberWriter);
+        w.put(double.class, numberWriter);
+        w.put(Float.class, numberWriter);
+        w.put(float.class, numberWriter);
+        w.put(Long.class, numberWriter);
+        w.put(long.class, numberWriter);
+        w.put(Integer.class, numberWriter);
+        w.put(int.class, numberWriter);
+        w.put(Short.class, numberWriter);
+        w.put(short.class, numberWriter);
+        w.put(Byte.class, numberWriter);
+        w.put(byte.class, numberWriter);
+
+        CellWriter booleanWriter = (ws, row, col, v) -> ws.value(row, col, (Boolean) v);
+        w.put(Boolean.class, booleanWriter);
+        w.put(boolean.class, booleanWriter);
+
+        CellWriter dateWriter = (ws, row, col, v) -> ws.value(row, col, (Date) v);
+        w.put(Date.class, dateWriter);
+
+        CellWriter localDateTimeWriter = (ws, row, col, v) -> ws.value(row, col, (LocalDateTime) v);
+        w.put(LocalDateTime.class, localDateTimeWriter);
+
+        CellWriter localDateWriter = (ws, row, col, v) -> ws.value(row, col, (LocalDate) v);
+        w.put(LocalDate.class, localDateWriter);
+
+        CellWriter zonedDateTimeWriter = (ws, row, col, v) -> ws.value(row, col, (java.time.ZonedDateTime) v);
+        w.put(java.time.ZonedDateTime.class, zonedDateTimeWriter);
+
+        WRITER_MAP = Collections.unmodifiableMap(w);
     }
 
     private TypeConverter() {
@@ -109,154 +271,72 @@ final class TypeConverter {
         return writerFor(targetType);
     }
 
+    /**
+     * 内置类型的 CellReader 查找（O(1) 基于 Map 分发）。
+     * Enum 类型通过缓存的 name-to-constant 映射查找，避免重复反射。
+     */
     @SuppressWarnings({"unchecked", "rawtypes"})
     static CellReader readerFor(Class<?> targetType) {
-        if (targetType == String.class) {
-            return cell -> {
-                if (cell == null || cell.getType() == CellType.EMPTY) return null;
-                return cell.getText();
-            };
+        CellReader builtin = READER_MAP.get(targetType);
+        if (builtin != null) {
+            return builtin;
         }
-        if (targetType == BigDecimal.class) {
-            return cell -> {
-                if (cell == null || cell.getType() == CellType.EMPTY) return null;
-                CellType ct = cell.getType();
-                if (ct == CellType.NUMBER || ct == CellType.FORMULA) return cell.asNumber();
-                throw new ExcelMappingException("Cannot convert cell type " + ct + " to BigDecimal");
-            };
-        }
-        if (targetType == Integer.class || targetType == int.class) {
-            return cell -> {
-                if (cell == null || cell.getType() == CellType.EMPTY) return null;
-                BigDecimal n = requireNumeric(cell);
-                return n != null ? Integer.valueOf(n.intValue()) : null;
-            };
-        }
-        if (targetType == Long.class || targetType == long.class) {
-            return cell -> {
-                if (cell == null || cell.getType() == CellType.EMPTY) return null;
-                BigDecimal n = requireNumeric(cell);
-                return n != null ? Long.valueOf(n.longValue()) : null;
-            };
-        }
-        if (targetType == Double.class || targetType == double.class) {
-            return cell -> {
-                if (cell == null || cell.getType() == CellType.EMPTY) return null;
-                BigDecimal n = requireNumeric(cell);
-                return n != null ? Double.valueOf(n.doubleValue()) : null;
-            };
-        }
-        if (targetType == Float.class || targetType == float.class) {
-            return cell -> {
-                if (cell == null || cell.getType() == CellType.EMPTY) return null;
-                BigDecimal n = requireNumeric(cell);
-                return n != null ? Float.valueOf(n.floatValue()) : null;
-            };
-        }
-        if (targetType == Short.class || targetType == short.class) {
-            return cell -> {
-                if (cell == null || cell.getType() == CellType.EMPTY) return null;
-                BigDecimal n = requireNumeric(cell);
-                return n != null ? Short.valueOf(n.shortValue()) : null;
-            };
-        }
-        if (targetType == Byte.class || targetType == byte.class) {
-            return cell -> {
-                if (cell == null || cell.getType() == CellType.EMPTY) return null;
-                BigDecimal n = requireNumeric(cell);
-                return n != null ? Byte.valueOf(n.byteValue()) : null;
-            };
-        }
-        if (targetType == Boolean.class || targetType == boolean.class) {
-            return cell -> {
-                if (cell == null || cell.getType() == CellType.EMPTY) return null;
-                CellType ct = cell.getType();
-                if (ct == CellType.NUMBER) {
-                    return cell.asNumber().compareTo(BigDecimal.ZERO) != 0;
-                }
-                if (ct == CellType.BOOLEAN || ct == CellType.FORMULA) {
-                    return cell.asBoolean();
-                }
-                throw new ExcelMappingException("Cannot convert cell type " + ct + " to Boolean");
-            };
-        }
-        if (targetType == Date.class) {
-            return cell -> {
-                if (cell == null || cell.getType() == CellType.EMPTY) return null;
-                LocalDateTime ldt = cell.asDate();
-                return ldt != null ? new Date(ldt.atZone(SYSTEM_ZONE).toInstant().toEpochMilli()) : null;
-            };
-        }
-        if (targetType == LocalDateTime.class) {
-            return cell -> {
-                if (cell == null || cell.getType() == CellType.EMPTY) return null;
-                return cell.asDate();
-            };
-        }
-        if (targetType == LocalDate.class) {
-            return cell -> {
-                if (cell == null || cell.getType() == CellType.EMPTY) return null;
-                LocalDateTime ldt = cell.asDate();
-                return ldt != null ? ldt.toLocalDate() : null;
-            };
-        }
-        if (targetType == java.time.ZonedDateTime.class) {
-            return cell -> {
-                if (cell == null || cell.getType() == CellType.EMPTY) return null;
-                LocalDateTime ldt = cell.asDate();
-                return ldt != null ? ldt.atZone(SYSTEM_ZONE) : null;
-            };
-        }
-        // Enum support
+        // Enum support with caching
         if (targetType.isEnum()) {
             Class<? extends Enum> enumType = (Class<? extends Enum>) targetType;
+            Map<String, Enum<?>> enumMap = getEnumCache(enumType);
             return cell -> {
                 if (cell == null || cell.getType() == CellType.EMPTY) return null;
                 String text = cell.getText();
                 if (text == null || text.isEmpty()) return null;
-                return Enum.valueOf(enumType, text.trim());
+                text = text.trim();
+                Enum<?> value = enumMap.get(text);
+                if (value == null) {
+                    throw new ExcelMappingException(
+                            "No enum constant " + enumType.getName() + "." + text);
+                }
+                return value;
             };
         }
         throw new ExcelMappingException("Unsupported field type: " + targetType.getName()
                 + ". Use @ExcelConverter to provide a custom converter.");
     }
 
+    /**
+     * 内置类型的 CellWriter 查找（O(1) 基于 Map 分发）。
+     */
     static CellWriter writerFor(Class<?> targetType) {
-        if (targetType == String.class) {
-            return (ws, r, c, v) -> ws.value(r, c, (String) v);
-        }
-        if (targetType == BigDecimal.class) {
-            return (ws, r, c, v) -> ws.value(r, c, (Number) v);
-        }
-        if (targetType == Double.class || targetType == double.class
-                || targetType == Float.class || targetType == float.class
-                || targetType == Long.class || targetType == long.class
-                || targetType == Integer.class || targetType == int.class
-                || targetType == Short.class || targetType == short.class
-                || targetType == Byte.class || targetType == byte.class) {
-            return (ws, r, c, v) -> ws.value(r, c, (Number) v);
-        }
-        if (targetType == Boolean.class || targetType == boolean.class) {
-            return (ws, r, c, v) -> ws.value(r, c, (Boolean) v);
-        }
-        if (targetType == Date.class) {
-            return (ws, r, c, v) -> ws.value(r, c, (Date) v);
-        }
-        if (targetType == LocalDateTime.class) {
-            return (ws, r, c, v) -> ws.value(r, c, (LocalDateTime) v);
-        }
-        if (targetType == LocalDate.class) {
-            return (ws, r, c, v) -> ws.value(r, c, (LocalDate) v);
-        }
-        if (targetType == java.time.ZonedDateTime.class) {
-            return (ws, r, c, v) -> ws.value(r, c, (java.time.ZonedDateTime) v);
+        CellWriter builtin = WRITER_MAP.get(targetType);
+        if (builtin != null) {
+            return builtin;
         }
         // Enum support — write as name()
         if (targetType.isEnum()) {
             return (ws, r, c, v) -> ws.value(r, c, ((Enum<?>) v).name());
         }
-        // Fallback
+        // Fallback: toString()
         return (ws, r, c, v) -> ws.value(r, c, v.toString());
+    }
+
+    // ── enum cache ────────────────────────────────────────────────────
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static Map<String, Enum<?>> getEnumCache(Class<? extends Enum> enumType) {
+        return ENUM_CACHE.computeIfAbsent((Class) enumType, type -> {
+            Enum[] constants = type.getEnumConstants();
+            Map<String, Enum<?>> map = new HashMap<>(constants.length * 2);
+            for (Enum<?> e : constants) {
+                map.put(e.name(), e);
+            }
+            return Collections.unmodifiableMap(map);
+        });
+    }
+
+    /**
+     * 清空枚举缓存（主要用于测试）。
+     */
+    static void clearEnumCache() {
+        ENUM_CACHE.clear();
     }
 
     private static BigDecimal requireNumeric(Cell cell) {

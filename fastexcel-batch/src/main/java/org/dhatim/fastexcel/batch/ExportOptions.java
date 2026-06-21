@@ -18,7 +18,17 @@ package org.dhatim.fastexcel.batch;
 /**
  * 批量 Excel 导出的配置。
  *
- * <p>使用 {@link #builder(int)} 来构建实例。</p>
+ * <p>使用 {@link #builder(int)} 或 {@link #unbounded()} 来构建实例。</p>
+ *
+ * <p>线程池配置说明：
+ * <ul>
+ *   <li>{@code threadPoolSize} — 并发获取 Sheet 数据的工作线程数</li>
+ *   <li>{@code queueCapacity} — 预取深度：已获取但尚未写入的 Sheet 数</li>
+ *   <li>{@code idleThreadTimeoutSec} — 内部线程池中空闲核心线程的超时时间（秒）</li>
+ * </ul>
+ * {@code threadPoolSize} 决定并发度，{@code queueCapacity} 控制背压。
+ * 对于 I/O 密集型数据源（如数据库），threadPoolSize 可以设为 4-8；
+ * 对于 CPU 密集型则设为核心数。</p>
  */
 public final class ExportOptions {
 
@@ -30,6 +40,8 @@ public final class ExportOptions {
     private final int flushInterval;
     private final String sheetNamePrefix;
     private final long fetchTimeoutMs;
+    private final long idleThreadTimeoutSec;
+    private final boolean failFast;
 
     private ExportOptions(Builder builder) {
         this.totalRows = builder.totalRows;
@@ -40,6 +52,8 @@ public final class ExportOptions {
         this.flushInterval = builder.flushInterval;
         this.sheetNamePrefix = builder.sheetNamePrefix;
         this.fetchTimeoutMs = builder.fetchTimeoutMs;
+        this.idleThreadTimeoutSec = builder.idleThreadTimeoutSec;
+        this.failFast = builder.failFast;
     }
 
     /**
@@ -62,16 +76,20 @@ public final class ExportOptions {
     }
 
     /** 总行数；流式（unbounded）模式下返回 -1。 */
-    public int getTotalRows()       { return totalRows; }
+    public int getTotalRows()           { return totalRows; }
     /** 是否为已知总行数模式。 */
-    public boolean isBounded()      { return bounded; }
-    public int getSheetSize()       { return sheetSize; }
-    public int getThreadPoolSize()  { return threadPoolSize; }
-    public int getQueueCapacity()   { return queueCapacity; }
-    public int getFlushInterval()   { return flushInterval; }
-    public String getSheetNamePrefix() { return sheetNamePrefix; }
+    public boolean isBounded()          { return bounded; }
+    public int getSheetSize()           { return sheetSize; }
+    public int getThreadPoolSize()      { return threadPoolSize; }
+    public int getQueueCapacity()       { return queueCapacity; }
+    public int getFlushInterval()       { return flushInterval; }
+    public String getSheetNamePrefix()  { return sheetNamePrefix; }
     /** 获取 fetch 超时时间（毫秒），0 表示无限等待。 */
-    public long getFetchTimeoutMs() { return fetchTimeoutMs; }
+    public long getFetchTimeoutMs()     { return fetchTimeoutMs; }
+    /** 内部线程池空闲线程超时时间（秒）。 */
+    public long getIdleThreadTimeoutSec() { return idleThreadTimeoutSec; }
+    /** 是否在首次 fetch 失败时立即中止（而非继续处理已排队的数据）。 */
+    public boolean isFailFast()         { return failFast; }
 
     public static final class Builder {
         private final int totalRows;
@@ -82,10 +100,13 @@ public final class ExportOptions {
         private int flushInterval = 0;
         private String sheetNamePrefix = "Sheet";
         private long fetchTimeoutMs = 0;
+        private long idleThreadTimeoutSec = 60;
+        private boolean failFast = true;
 
         Builder(int totalRows) {
             if (totalRows <= 0) {
-                throw new IllegalArgumentException("totalRows must be > 0, was " + totalRows);
+                throw new IllegalArgumentException(
+                        "totalRows must be > 0, was " + totalRows);
             }
             this.totalRows = totalRows;
             this.bounded = true;
@@ -99,7 +120,8 @@ public final class ExportOptions {
         /** 每个 Sheet 的行数。必须 &gt; 0。 */
         public Builder sheetSize(int sheetSize) {
             if (sheetSize <= 0) {
-                throw new IllegalArgumentException("sheetSize must be > 0, was " + sheetSize);
+                throw new IllegalArgumentException(
+                        "sheetSize must be > 0, was " + sheetSize);
             }
             this.sheetSize = sheetSize;
             return this;
@@ -107,14 +129,19 @@ public final class ExportOptions {
 
         /** 并发获取 Sheet 数据的线程数。默认为 1。 */
         public Builder threadPoolSize(int threadPoolSize) {
+            if (threadPoolSize < 0) {
+                throw new IllegalArgumentException(
+                        "threadPoolSize must be >= 0, was " + threadPoolSize);
+            }
             this.threadPoolSize = threadPoolSize;
             return this;
         }
 
-        /** 供给写入线程的工作队列容量。必须 &gt; 0。 */
+        /** 预取队列容量（已获取但尚未写入的 Sheet 数）。必须 &gt; 0。 */
         public Builder queueCapacity(int queueCapacity) {
             if (queueCapacity <= 0) {
-                throw new IllegalArgumentException("queueCapacity must be > 0, was " + queueCapacity);
+                throw new IllegalArgumentException(
+                        "queueCapacity must be > 0, was " + queueCapacity);
             }
             this.queueCapacity = queueCapacity;
             return this;
@@ -122,6 +149,10 @@ public final class ExportOptions {
 
         /** 每隔 N 行将工作表刷新到输出流（0 表示不进行中间刷新）。 */
         public Builder flushInterval(int flushInterval) {
+            if (flushInterval < 0) {
+                throw new IllegalArgumentException(
+                        "flushInterval must be >= 0, was " + flushInterval);
+            }
             this.flushInterval = flushInterval;
             return this;
         }
@@ -138,9 +169,33 @@ public final class ExportOptions {
          */
         public Builder fetchTimeoutMs(long fetchTimeoutMs) {
             if (fetchTimeoutMs < 0) {
-                throw new IllegalArgumentException("fetchTimeoutMs must be >= 0, was " + fetchTimeoutMs);
+                throw new IllegalArgumentException(
+                        "fetchTimeoutMs must be >= 0, was " + fetchTimeoutMs);
             }
             this.fetchTimeoutMs = fetchTimeoutMs;
+            return this;
+        }
+
+        /**
+         * 内部线程池的空闲核心线程超时时间（秒）。
+         * 默认为 60 秒。当使用内部线程池时生效。
+         */
+        public Builder idleThreadTimeoutSec(long idleThreadTimeoutSec) {
+            if (idleThreadTimeoutSec < 0) {
+                throw new IllegalArgumentException(
+                        "idleThreadTimeoutSec must be >= 0, was "
+                                + idleThreadTimeoutSec);
+            }
+            this.idleThreadTimeoutSec = idleThreadTimeoutSec;
+            return this;
+        }
+
+        /**
+         * 是否在首次 fetch 失败时立即中止（默认 true）。
+         * 设为 false 则会继续处理已排队的数据再抛出异常。
+         */
+        public Builder failFast(boolean failFast) {
+            this.failFast = failFast;
             return this;
         }
 

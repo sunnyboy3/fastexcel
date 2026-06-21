@@ -20,7 +20,9 @@ import org.dhatim.fastexcel.Worksheet;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ExecutionException;
@@ -33,6 +35,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.function.BiFunction;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
 /**
  * 使用并发获取-写入流水线将分页数据导出到多 Sheet 的 Excel 工作簿：
@@ -193,50 +196,59 @@ public class BatchExcelWriter<T, P> {
         boolean bounded = options.isBounded();
         int totalRows = options.getTotalRows();
         int sheetSize = options.getSheetSize();
-        int sheetCount = bounded
-                ? (totalRows + sheetSize - 1) / sheetSize
-                : -1;
+        long sheetCount = bounded
+                ? (totalRows + (long) sheetSize - 1) / sheetSize
+                : -1L;
+
+        // 使用独立的线程池，确保核心线程超时后可回收
         int concurrency = Math.max(1, options.getThreadPoolSize());
-        // 预取深度独立于线程数：队列里最多堆放 prefetch 个待写 Sheet。
         int prefetch = Math.max(1, options.getQueueCapacity());
         int flushInterval = options.getFlushInterval();
         long fetchTimeoutMs = options.getFetchTimeoutMs();
 
         boolean ownExecutor = (externalExecutor == null);
         ExecutorService executor = ownExecutor ? createExecutor(concurrency) : externalExecutor;
-        // Bounded queue of futures — submitted in sheet order, so polling
-        // preserves order while concurrent fetches happen in the background.
+
+        // 有界队列：按 sheet 顺序提交，poll 保持写入顺序，
+        // 同时后台并发获取。队列容量控制背压。
         LinkedBlockingQueue<Future<List<T>>> fetchQueue =
-                new LinkedBlockingQueue<Future<List<T>>>(prefetch);
-        List<Future<List<T>>> pending = new ArrayList<Future<List<T>>>();
+                new LinkedBlockingQueue<>(prefetch);
+        // 使用 Deque 追踪 pending futures（仅在取消时需要）
+        Deque<Future<List<T>>> pending = new ArrayDeque<>();
 
         try (Workbook wb = new Workbook(outputStream, "fastexcel-batch", "1.0")) {
             customizer.beforeSheets(wb);
 
-            // Fill the pipeline up to prefetch depth.
+            // ── 管线预填充 ────────────────────────────────────────────
             int nextSheet = 0;
-            for (int i = 0; i < prefetch && (sheetCount < 0 || nextSheet < sheetCount);
+            for (int i = 0; i < prefetch && isMoreSheets(sheetCount, nextSheet);
                  i++, nextSheet++) {
-                Future<List<T>> f = submit(executor, params, sheetSize, nextSheet, totalRows, bounded);
-                pending.add(f);
+                Future<List<T>> f = submit(executor, params, sheetSize,
+                        nextSheet, totalRows, bounded);
+                if (f == null) break; // limit <= 0, nothing to fetch
+                pending.addLast(f);
                 fetchQueue.add(f);
             }
 
-            List<SheetExportResult> sheetResults = new ArrayList<SheetExportResult>();
+            List<SheetExportResult> sheetResults = new ArrayList<>();
             int writtenRows = 0;
             Throwable failure = null;
             boolean wasCancelled = false;
+            boolean dataExhausted = false;
 
-            for (int s = 0; sheetCount < 0 || s < sheetCount; s++) {
+            for (int s = 0; isMoreSheets(sheetCount, s); s++) {
+                // ── 取消检查 ───────────────────────────────────────────
                 if (cancelled != null && cancelled.getAsBoolean()) {
                     wasCancelled = true;
                     break;
                 }
+
+                // ── 获取下一批数据 ─────────────────────────────────────
                 Future<List<T>> future = fetchQueue.poll();
                 if (future == null) {
-                    // No more work queued (streaming pipeline drained).
-                    break;
+                    break; // 管线已排空
                 }
+
                 List<T> rows;
                 try {
                     rows = fetchTimeoutMs > 0
@@ -256,54 +268,63 @@ public class BatchExcelWriter<T, P> {
                     break;
                 }
 
-                // Streaming: an empty batch means data is exhausted — stop
-                // without writing an empty sheet.
+                // ── 流式模式：空数据 / 短批次检测 ──────────────────────
                 boolean lastBatch = false;
                 if (!bounded) {
                     if (rows.isEmpty()) {
                         break;
                     }
                     if (rows.size() < sheetSize) {
-                        lastBatch = true; // short batch — no more data after this
+                        lastBatch = true;
                     }
                 }
 
-                // Apply data transformer if present
+                // ── 数据转换 ───────────────────────────────────────────
                 if (dataTransformer != null) {
                     rows = dataTransformer.apply(rows);
                 }
 
-                // Replenish pipeline: submit next fetch while writing this sheet.
-                // In streaming mode, stop submitting once we hit a short/last batch.
-                if ((sheetCount < 0 || nextSheet < sheetCount) && !lastBatch) {
+                // ── 管线补充：写入当前 Sheet 的同时提交下一次 fetch ────
+                if (isMoreSheets(sheetCount, nextSheet) && !lastBatch) {
                     Future<List<T>> f = submit(executor, params, sheetSize,
                             nextSheet, totalRows, bounded);
-                    pending.add(f);
-                    fetchQueue.add(f);
+                    if (f != null) {
+                        pending.addLast(f);
+                        fetchQueue.add(f);
+                    }
                     nextSheet++;
                 }
 
+                // ── 进度通知：Sheet 开始 ───────────────────────────────
                 if (progress != null) {
-                    progress.onSheetStarted(s, sheetCount);
+                    progress.onSheetStarted(s,
+                            bounded ? (int) sheetCount : -1);
                 }
 
-                // Write sheet
+                // ── 写入 Sheet ─────────────────────────────────────────
                 String sheetName = naming.name(options.getSheetNamePrefix(),
-                        s, sheetCount);
+                        s, bounded ? (int) sheetCount : -1);
                 Worksheet ws = wb.newWorksheet(sheetName);
                 rowWriter.writeHeader(ws);
 
                 int rowIdx = 1;
-                for (T row : rows) {
+                for (int i = 0, len = rows.size(); i < len; i++) {
+                    T row = rows.get(i);
                     rowWriter.writeRow(ws, rowIdx, row);
                     rowIdx++;
                     writtenRows++;
+                    // 中间刷新：减少内存峰值
                     if (flushInterval > 0 && rowIdx % flushInterval == 0) {
                         ws.flush();
                     }
                 }
+                // 确保最后一批数据写入：在 sheet 关闭前 flush
+                if (flushInterval > 0 && (rowIdx - 1) % flushInterval != 0) {
+                    ws.flush();
+                }
                 ws.close();
 
+                // ── 记录结果 ───────────────────────────────────────────
                 String dataPath = dataPathFn != null
                         ? dataPathFn.apply(params,
                                 new DataRequest((long) s * sheetSize,
@@ -311,23 +332,27 @@ public class BatchExcelWriter<T, P> {
                         : null;
                 sheetResults.add(new SheetExportResult(dataPath, rows.size()));
 
+                // ── 进度通知：Sheet 完成 ───────────────────────────────
                 if (progress != null) {
-                    progress.onSheetCompleted(s, sheetCount,
+                    progress.onSheetCompleted(s,
+                            bounded ? (int) sheetCount : -1,
                             rows.size(), writtenRows);
                 }
 
                 if (lastBatch) {
+                    dataExhausted = true;
                     break;
                 }
             }
 
-            // Cancel pending futures on failure, cancellation, or completion
+            // ── 清理 pending futures ───────────────────────────────────
             for (Future<List<T>> f : pending) {
                 f.cancel(true);
             }
 
             customizer.afterSheets(wb);
 
+            // ── 结果处理 ───────────────────────────────────────────────
             if (failure != null) {
                 if (progress != null) {
                     progress.onExportFinished(false, writtenRows);
@@ -366,14 +391,28 @@ public class BatchExcelWriter<T, P> {
 
     // ── internal ──────────────────────────────────────────────────────
 
+    /**
+     * 检查是否还有更多 Sheet 需要处理。
+     * sheetCount &lt; 0 表示流式模式（未知总数）。
+     */
+    private static boolean isMoreSheets(long sheetCount, int sheetIndex) {
+        return sheetCount < 0 || sheetIndex < sheetCount;
+    }
+
+    /**
+     * 提交异步 fetch 任务。返回 null 表示无需提交（limit &lt;= 0）。
+     */
     private Future<List<T>> submit(ExecutorService executor, P params,
-                                    int sheetSize, int sheetIndex, int totalRows,
-                                    boolean bounded) {
-        // In streaming mode totalRows is unknown (-1) — always request a full page.
-        // Use long arithmetic to avoid int overflow when sheetIndex * sheetSize > Integer.MAX_VALUE.
+                                    int sheetSize, int sheetIndex,
+                                    int totalRows, boolean bounded) {
         int limit = bounded
-                ? (int) Math.min(sheetSize, totalRows - (long) sheetIndex * sheetSize)
+                ? (int) Math.min(sheetSize,
+                        totalRows - (long) sheetIndex * sheetSize)
                 : sheetSize;
+        // 当 limit <= 0 时不提交无效的 fetch
+        if (limit <= 0) {
+            return null;
+        }
         long offset = (long) sheetIndex * sheetSize;
         DataRequest request = new DataRequest(offset, limit, sheetIndex);
         return executor.submit(() -> {
@@ -384,16 +423,18 @@ public class BatchExcelWriter<T, P> {
             } catch (Exception e) {
                 throw new BatchExcelExportException(
                         "Failed to fetch data for sheet " + sheetIndex
-                                + " (offset=" + offset + ", limit=" + limit + ")", e);
+                                + " (offset=" + offset
+                                + ", limit=" + limit + ")", e);
             }
         });
     }
 
     private ExecutorService createExecutor(int nThreads) {
+        long idleSec = options.getIdleThreadTimeoutSec();
         ThreadPoolExecutor pool = new ThreadPoolExecutor(
                 nThreads, nThreads,
-                60L, TimeUnit.SECONDS,
-                new LinkedBlockingQueue<Runnable>(),
+                idleSec, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(),
                 r -> {
                     Thread t = new Thread(r, "fastexcel-batch");
                     t.setDaemon(true);
